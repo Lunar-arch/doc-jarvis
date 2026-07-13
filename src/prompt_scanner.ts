@@ -7,6 +7,11 @@
  *
  * Matching is case-insensitive — `@Jarvis`, `@JARVIS`, `@jarvis` all match.
  * If a prompt already has the 👀 eyes marker, it's skipped (already seen/being processed).
+ *
+ * IMPORTANT: Google Docs API indices are 1-based (first char in body = index 1),
+ * but our bodyText string is 0-based. We add +1 to all indices so the doc writer
+ * inserts at the correct position in the document. We also cap the endIndex to
+ * avoid inserting past the end of the document segment.
  */
 import type { AppConfig, DocContent, PromptBlock } from './types.js';
 
@@ -17,10 +22,12 @@ export class PromptScanner {
   private readonly trigger: string;
   private readonly triggerLower: string;
   private readonly endPattern: RegExp;
+  private readonly eyes: string;
 
   constructor(config: AppConfig) {
     this.trigger = config.trigger_keyword;
     this.triggerLower = config.trigger_keyword.toLowerCase();
+    this.eyes = config.seen_marker || '\uD83D\uDC40';
     // Convert the config end_pattern string to a RegExp
     // Default: \n\n (blank line)
     const patternStr = config.prompt_delimiter.end_pattern || '\\n\\n';
@@ -61,16 +68,22 @@ export class PromptScanner {
       const promptText = text.slice(promptStart, promptEnd).trim();
 
       if (promptText.length > 0) {
-        // Skip if the prompt already has the 👀 marker (already seen/processed)
-        if (promptText.includes(EYES)) {
+        // Skip if the prompt already has the eyes marker (already seen/processed)
+        if (promptText.includes(this.eyes)) {
           searchOffset = promptEnd;
           continue;
         }
 
+        // Convert 0-based string indices to 1-based Google Docs API indices.
+        // Cap at text.length to avoid "Index must be less than end index" errors
+        // when the prompt extends to the very end of the document.
+        const apiStartIndex = triggerIdx + 1;
+        const apiEndIndex = Math.min(promptEnd + 1, text.length);
+
         prompts.push({
           docId: doc.docId,
-          startIndex: triggerIdx,
-          endIndex: promptEnd,
+          startIndex: apiStartIndex,
+          endIndex: apiEndIndex,
           trigger: text.slice(triggerIdx, triggerIdx + this.trigger.length),
           promptText,
           hash: '', // No longer used — dedup is via the 👀 marker

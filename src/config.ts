@@ -11,6 +11,9 @@ const DEFAULTS: AppConfig = {
   drive_search_keyword: 'jarvis',
   poll_interval_ms: 10_000,
   stream_interval_ms: 500,
+  response_prefix: 'Jarvis: ',
+  seen_marker: '\uD83D\uDC40', // 👀
+  commands_enabled: true,
   openclaw: {
     gateway_url: 'http://localhost:18789',
     gateway_token: '',

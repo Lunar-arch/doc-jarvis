@@ -14,21 +14,25 @@ import { DocsClient } from './docs.js';
 export class DocWriter {
   private readonly docsClient: DocsClient;
   private readonly streamIntervalMs: number;
+  private readonly responsePrefix: string;
+  private readonly seenMarker: string;
   private readonly log: Logger;
 
   constructor(docsClient: DocsClient, config: AppConfig, log: Logger) {
     this.docsClient = docsClient;
     this.streamIntervalMs = config.stream_interval_ms;
+    this.responsePrefix = config.response_prefix || 'Jarvis: ';
+    this.seenMarker = config.seen_marker || '\uD83D\uDC40';
     this.log = log;
   }
 
   async writeResponse(prompt: PromptBlock, chunks: AsyncGenerator<ResponseChunk>): Promise<void> {
     const insertIndex = prompt.endIndex;
 
-    // Step 1: Insert " 👀" right after the prompt text (NEVER removed)
+    // Step 1: Insert the seen marker right after the prompt text (NEVER removed)
     const text = prompt.promptText;
     const needsSpace = text.length > 0 && !text.endsWith(' ');
-    const eyesText = needsSpace ? ' \uD83D\uDC40' : '\uD83D\uDC40'; // 👀 = U+1F440
+    const eyesText = needsSpace ? ` ${this.seenMarker}` : this.seenMarker;
     await this.docsClient.insertText(prompt.docId, eyesText, insertIndex);
 
     // Response goes right after the eyes
@@ -48,8 +52,8 @@ export class DocWriter {
         if (chunk.text.length === 0 && !chunk.done) continue;
 
         if (firstChunk) {
-          // Insert "\n\nJarvis: " + first chunk after the eyes
-          const responsePrefix = '\n\nJarvis: ';
+          // Insert "\n\n" + response prefix + first chunk after the eyes
+          const responsePrefix = `\n\n${this.responsePrefix}`;
           const textToInsert = responsePrefix + chunk.text;
           await this.docsClient.insertText(prompt.docId, textToInsert, responseStart);
           responseIdx = responseStart + textToInsert.length;

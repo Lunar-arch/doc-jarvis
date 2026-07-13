@@ -22,6 +22,7 @@ import { PromptScanner } from './prompt_scanner.js';
 import { TypingGuard } from './typing_guard.js';
 import { OpenClawClient } from './openclaw_client.js';
 import { DocWriter } from './doc_writer.js';
+import { CommandHandler } from './commands.js';
 import type { AppConfig, Logger } from './types.js';
 
 const logger: Logger = {
@@ -56,6 +57,7 @@ async function main(): Promise<void> {
   const typingGuard = new TypingGuard();
   const openclaw = new OpenClawClient(config, logger);
   const writer = new DocWriter(docsClient, config, logger);
+  const commandHandler = new CommandHandler(docsClient, config, openclaw, logger);
 
   // Check gateway health
   const healthy = await openclaw.healthCheck();
@@ -82,7 +84,7 @@ async function main(): Promise<void> {
       // Process docs concurrently
       await Promise.allSettled(
         docs.map((docInfo) =>
-          processDoc(docInfo.id, docsClient, scanner, typingGuard, openclaw, writer, logger),
+          processDoc(docInfo.id, docsClient, scanner, typingGuard, openclaw, writer, commandHandler, logger),
         ),
       );
     } catch (err) {
@@ -103,10 +105,27 @@ async function processDoc(
   typingGuard: TypingGuard,
   openclaw: OpenClawClient,
   writer: DocWriter,
+  commandHandler: CommandHandler,
   log: Logger,
 ): Promise<void> {
   try {
     const doc = await docsClient.getDoc(docId);
+
+    // Step 1: Check for commands first (they take priority over prompts)
+    // But skip command processing if commands are disabled via @commands-enabled false
+    const commands = commandHandler.scan(doc);
+    for (const cmd of commands) {
+      log.info(`Detected command @${cmd.command} in doc ${docId}`);
+      // Apply typing guard to commands too — wait for user to stop typing
+      if (!typingGuard.isSettled({ docId, startIndex: 0, endIndex: 0, trigger: '', promptText: cmd.fullText, hash: '' })) {
+        log.debug(`Command @${cmd.command} not settled yet — skipping`);
+        continue;
+      }
+      await commandHandler.handle(cmd);
+      typingGuard.forget(cmd.fullText);
+    }
+
+    // Step 2: Check for regular @jarvis prompts
     const prompts = scanner.scan(doc);
     if (prompts.length === 0) return;
 
@@ -125,7 +144,7 @@ async function processDoc(
       log.info(`Sending prompt from doc ${docId} to OpenClaw`);
 
       try {
-        const chunks = openclaw.sendPrompt(prompt.promptText);
+        const chunks = openclaw.sendPrompt(docId, prompt.promptText);
         await writer.writeResponse(prompt, chunks);
         typingGuard.forget(prompt.promptText);
       } catch (err) {

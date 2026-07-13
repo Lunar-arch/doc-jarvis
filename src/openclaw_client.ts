@@ -1,66 +1,87 @@
 /**
- * OpenClaw Gateway client — sends prompts and receives streamed responses.
+ * OpenClaw Gateway client — sends prompts via /v1/chat/completions with
+ * per-document session routing for full conversation context.
  *
- * Uses the OpenResponses-compatible `/v1/responses` endpoint (must be enabled
- * in OpenClaw config via `gateway.http.endpoints.responses.enabled: true`).
+ * Each document gets its own OpenClaw session, keyed by the doc ID.
+ * The @clear command increments a counter to start a fresh session
+ * (e.g. <docId>, <docId>-2, <docId>-3, etc.) — old sessions age out
+ * automatically via OpenClaw maintenance.
  *
- * Supports both SSE streaming and non-streaming (fallback) responses.
- * Handles: gateway down, rate limits (429), timeouts, and retry logic.
- *
- * @see https://github.com/openclaw/openclaw — OpenClaw documentation
+ * Requires: gateway.http.endpoints.chatCompletions.enabled: true
  */
 import type { AppConfig, Logger, ResponseChunk } from './types.js';
 
 export class OpenClawClient {
   private readonly gatewayUrl: string;
   private readonly gatewayToken: string;
-  private readonly sessionKey: string;
   private readonly model: string;
   private readonly log: Logger;
-  private readonly timeoutMs = 60_000;
+  private readonly timeoutMs = 120_000;
+
+  /** Maps docId → current session key (docId, docId-2, docId-3, etc.) */
+  private sessionKeys = new Map<string, string>();
+  /** Maps docId → clear counter */
+  private clearCounters = new Map<string, number>();
 
   constructor(config: AppConfig, log: Logger) {
     this.gatewayUrl = config.openclaw.gateway_url.replace(/\/$/, '');
     this.gatewayToken = config.openclaw.gateway_token;
-    this.sessionKey = config.openclaw.session_key;
     this.model = config.openclaw.model || 'openclaw';
     this.log = log;
   }
 
+  /** Get the current session key for a doc (creates one if none exists) */
+  getSessionKey(docId: string): string {
+    let key = this.sessionKeys.get(docId);
+    if (!key) {
+      const counter = this.clearCounters.get(docId) ?? 0;
+      key = counter === 0 ? docId : `${docId}-${counter}`;
+      this.sessionKeys.set(docId, key);
+    }
+    return key;
+  }
+
+  /** Clear the session for a doc — next prompt will start a fresh session */
+  clearSession(docId: string): string {
+    const counter = (this.clearCounters.get(docId) ?? 0) + 1;
+    this.clearCounters.set(docId, counter);
+    const newKey = `${docId}-${counter}`;
+    this.sessionKeys.set(docId, newKey);
+    this.log.info(`Cleared session for doc ${docId} → new session key: ${newKey}`);
+    return newKey;
+  }
+
   /** Build request headers with auth + session routing */
-  private buildHeaders(): Record<string, string> {
+  private buildHeaders(sessionKey: string): Record<string, string> {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       'x-openclaw-agent-id': 'main',
+      'x-openclaw-session-key': sessionKey,
     };
 
     if (this.gatewayToken) {
       headers['Authorization'] = `Bearer ${this.gatewayToken}`;
     }
 
-    if (this.sessionKey) {
-      headers['x-openclaw-session-key'] = this.sessionKey;
-    }
-
     return headers;
   }
 
   /**
-   * Send a prompt to the OpenClaw Gateway via the /v1/responses endpoint.
+   * Send a prompt to the OpenClaw Gateway via /v1/chat/completions.
+   * Uses the doc ID as the session key for conversation continuity.
    *
-   * Yields ResponseChunk objects as chunks arrive. Falls back to non-streaming
-   * if SSE is not supported.
+   * Yields ResponseChunk objects as chunks arrive.
    */
-  async *sendPrompt(prompt: string): AsyncGenerator<ResponseChunk> {
-    const url = `${this.gatewayUrl}/v1/responses`;
-    const headers = this.buildHeaders();
+  async *sendPrompt(docId: string, prompt: string): AsyncGenerator<ResponseChunk> {
+    const sessionKey = this.getSessionKey(docId);
+    const url = `${this.gatewayUrl}/v1/chat/completions`;
+    const headers = this.buildHeaders(sessionKey);
 
-    // OpenResponses-compatible request body
+    // OpenAI Chat Completions format
     const body = JSON.stringify({
       model: this.model,
-      input: prompt,
+      messages: [{ role: 'user', content: prompt }],
       stream: true,
-      ...(this.sessionKey ? { user: this.sessionKey } : {}),
     });
 
     try {
@@ -76,7 +97,7 @@ export class OpenClawClient {
         const wait = retryAfter ? parseInt(retryAfter, 10) * 1000 : 5000;
         this.log.warn(`Rate limited (429) — waiting ${wait}ms before retry`);
         await sleep(wait);
-        yield* this.sendPrompt(prompt);
+        yield* this.sendPrompt(docId, prompt);
         return;
       }
 
@@ -88,12 +109,11 @@ export class OpenClawClient {
       const contentType = res.headers.get('Content-Type') ?? '';
 
       if (contentType.includes('text/event-stream')) {
-        // OpenResponses SSE streaming
-        yield* this.parseOpenResponsesSSE(res);
+        yield* this.parseChatCompletionsSSE(res);
       } else {
-        // Non-streaming fallback — OpenResponses ResponseResource
-        const data = await res.json() as OpenResponsesResponse;
-        const text = extractResponseText(data);
+        // Non-streaming fallback
+        const data = await res.json() as ChatCompletionsResponse;
+        const text = data.choices?.[0]?.message?.content ?? '';
         yield { text, done: true };
       }
     } catch (err) {
@@ -105,18 +125,12 @@ export class OpenClawClient {
   }
 
   /**
-   * Parse an OpenResponses SSE stream into ResponseChunks.
+   * Parse an OpenAI Chat Completions SSE stream.
    *
-   * Event types emitted by the Gateway:
-   *   response.created, response.in_progress, response.output_item.added,
-   *   response.content_part.added, response.output_text.delta,
-   *   response.output_text.done, response.content_part.done,
-   *   response.output_item.done, response.completed, response.failed
-   *
-   * Text deltas arrive in `response.output_text.delta` events (field: `delta`).
-   * The stream terminates with `data: [DONE]`.
+   * Chunks have: choices[0].delta.content (text deltas)
+   * Stream ends with: data: [DONE]
    */
-  private async *parseOpenResponsesSSE(res: Response): AsyncGenerator<ResponseChunk> {
+  private async *parseChatCompletionsSSE(res: Response): AsyncGenerator<ResponseChunk> {
     const reader = res.body?.getReader();
     if (!reader) return;
 
@@ -136,46 +150,32 @@ export class OpenClawClient {
 
         for (const event of events) {
           const lines = event.split('\n');
-          // SSE events may have an `event:` line (event type) and `data:` line (payload)
-          let eventType = '';
-          let dataLine = '';
 
           for (const line of lines) {
-            if (line.startsWith('event: ')) {
-              eventType = line.slice(7).trim();
-            } else if (line.startsWith('data: ')) {
-              dataLine = line.slice(6).trim();
+            if (!line.startsWith('data: ')) continue;
+
+            const data = line.slice(6).trim();
+            if (data === '[DONE]') {
+              yield { text: '', done: true };
+              return;
             }
-          }
 
-          if (!dataLine) continue;
-          if (dataLine === '[DONE]') {
-            return;
-          }
-
-          try {
-            const parsed = JSON.parse(dataLine) as OpenResponsesSSEEvent;
-
-            // Text deltas arrive in response.output_text.delta events
-            if (eventType === 'response.output_text.delta' || parsed.type === 'response.output_text.delta') {
-              const delta = (parsed as { delta?: string }).delta ?? '';
+            try {
+              const parsed = JSON.parse(data) as ChatCompletionsChunk;
+              const delta = parsed.choices?.[0]?.delta?.content ?? '';
               if (delta) {
                 yield { text: delta, done: false };
               }
-            } else if (eventType === 'response.completed' || parsed.type === 'response.completed') {
-              yield { text: '', done: true };
-              return;
-            } else if (eventType === 'response.failed' || parsed.type === 'response.failed') {
-              const errorMsg = (parsed as { error?: { message?: string } }).error?.message ?? 'Unknown error';
-              throw new Error(`OpenClaw response failed: ${errorMsg}`);
+              // Check for finish_reason
+              const finishReason = parsed.choices?.[0]?.finish_reason;
+              if (finishReason === 'stop' || finishReason === 'length') {
+                yield { text: '', done: true };
+                return;
+              }
+            } catch {
+              // Non-JSON data line — skip
+              this.log.debug('Unparseable SSE data line:', data);
             }
-          } catch (err) {
-            // If it's our own throw, re-throw
-            if (err instanceof Error && err.message.startsWith('OpenClaw response failed')) {
-              throw err;
-            }
-            // Non-JSON data line — skip
-            this.log.debug('Unparseable SSE data line:', dataLine);
           }
         }
       }
@@ -199,43 +199,19 @@ export class OpenClawClient {
   }
 }
 
-/**
- * OpenResponses non-streaming response (ResponseResource).
- * The output array contains items with content parts that hold the text.
- */
-interface OpenResponsesResponse {
-  id?: string;
-  model?: string;
-  output?: Array<{
-    type?: string;
-    content?: Array<{
-      type?: string;
-      text?: string;
-    }>;
+/** Non-streaming Chat Completions response */
+interface ChatCompletionsResponse {
+  choices?: Array<{
+    message?: { content?: string };
   }>;
-  output_text?: string;
 }
 
-/** SSE event from the OpenResponses stream */
-interface OpenResponsesSSEEvent {
-  type?: string;
-  delta?: string;
-  error?: { message?: string };
-}
-
-/** Extract text from a non-streaming OpenResponses ResponseResource */
-function extractResponseText(data: OpenResponsesResponse): string {
-  // Some responses include a top-level output_text field
-  if (data.output_text) return data.output_text;
-
-  // Otherwise, collect text from output[].content[].text
-  const parts: string[] = [];
-  for (const item of data.output ?? []) {
-    for (const content of item.content ?? []) {
-      if (content.text) parts.push(content.text);
-    }
-  }
-  return parts.join('');
+/** Streaming Chat Completions chunk */
+interface ChatCompletionsChunk {
+  choices?: Array<{
+    delta?: { content?: string };
+    finish_reason?: string | null;
+  }>;
 }
 
 function sleep(ms: number): Promise<void> {

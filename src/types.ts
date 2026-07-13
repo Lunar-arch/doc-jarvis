@@ -8,6 +8,9 @@ export interface AppConfig {
   drive_search_keyword: string;
   poll_interval_ms: number;
   stream_interval_ms: number;
+  response_prefix: string;
+  seen_marker: string;
+  commands_enabled: boolean;
   openclaw: OpenClawConfig;
   google: GoogleConfig;
   prompt_delimiter: PromptDelimiterConfig;
@@ -98,6 +101,21 @@ export interface PromptTrackerState {
 export interface ResponseChunk {
   text: string;
   done: boolean;
+}
+
+/** A command detected in a document (e.g. @gateway-start, @model) */
+export interface CommandBlock {
+  docId: string;
+  /** Start index of the command token in the doc body (1-based API index) */
+  startIndex: number;
+  /** End index of the command text (1-based API index, exclusive) */
+  endIndex: number;
+  /** The command name (e.g. "gateway-start", "model") */
+  command: string;
+  /** Arguments after the command (e.g. "ollama/glm-5.2:cloud") */
+  args: string;
+  /** The full text after the @trigger (command + args) */
+  fullText: string;
 }
 
 /** Logger interface so modules can use a consistent logging API */
