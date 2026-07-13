@@ -1,0 +1,30 @@
+{
+  "name": "doc-jarvis",
+  "version": "0.1.0",
+  "description": "Google Docs to OpenClaw bridge — monitors Drive for prompts and streams AI responses back into the doc",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "build": "tsc",
+    "clean": "rimraf dist",
+    "lint": "eslint src --ext .ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "google-auth-library": "^9.10.0",
+    "googleapis": "^140.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "rimraf": "^5.0.7",
+    "tsx": "^4.15.0",
+    "typescript": "^5.5.0"
+  }
+}

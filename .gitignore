@@ -2,6 +2,9 @@ node_modules/
 dist/
 .env
 tokens/
+state/
+.playwright-mcp/
 *.log
+*.log.*
 
 AGENTS.md

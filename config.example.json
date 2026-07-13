@@ -1,0 +1,22 @@
+{
+  "trigger_keyword": "@jarvis",
+  "drive_search_keyword": "jarvis",
+  "poll_interval_ms": 30000,
+  "stream_interval_ms": 500,
+  "openclaw": {
+    "gateway_url": "http://localhost:18789",
+    "gateway_token": "",
+    "session_key": "",
+    "model": ""
+  },
+  "google": {
+    "client_id": "",
+    "client_secret": "",
+    "redirect_uri": "http://localhost:8080/oauth2callback",
+    "token_path": "./tokens/google-token.json"
+  },
+  "prompt_delimiter": {
+    "start": "@jarvis",
+    "end_pattern": "\\n\\n"
+  }
+}
